@@ -391,7 +391,11 @@ services:
   # =============== PROFILE: minio ===============
 
   minio:
-    image: minio/minio
+    # minio/minio was deleted from Docker Hub on 2026-09-11 (MinIO's open-source
+    # retreat; quay.io/minio/minio is now auth-gated too). Use the AIStor
+    # free-tier image on Quay, which is still anonymously pullable and bundles
+    # both the `minio` server and the `mc` client binaries.
+    image: quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z
     pull_policy: if_not_present
     profiles: [minio]
     restart: unless-stopped
@@ -400,6 +404,8 @@ services:
     environment:
       - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-rag_flow}
       - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-infini_rag_flow}
+      # Silence AIStor free-tier update/telemetry check.
+      - MINIO_UPDATE_MINFREQDAYS=0
     ports:
       - "${MINIO_API_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
@@ -413,7 +419,8 @@ services:
       start_period: 20s
 
   minio-init:
-    image: minio/mc
+    # Same AIStor image (bundles `mc`); minio/mc was also deleted from Docker Hub.
+    image: quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z
     pull_policy: if_not_present
     profiles: [minio]
     restart: "no"
