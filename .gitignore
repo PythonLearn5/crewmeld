@@ -45,3 +45,4 @@ apps/crewmeld/socket-bundled.js
 backup_*.sql
 *.dump
 
+/.idea/
