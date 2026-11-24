@@ -512,6 +512,95 @@ Helm Chart 已通过 `helm lint --strict`，覆盖：
 
 ---
 
+## 本地调试
+
+在 TraeCode / VS Code 中通过断点调试 Next.js 服务端代码（如对话引擎 `processMessage`、API 路由等）。
+
+### 前置条件
+
+```bash
+# 1. 用 dev compose 启动 DB + Redis（暴露端口到宿主机）
+docker compose -f docker-compose.dev.yml up -d db redis
+
+# 2. 确认 .env 存在且 DATABASE_URL / REDIS_URL 指向 localhost
+```
+
+### 清理占用端口
+
+启动前如遇端口冲突（`EADDRINUSE`），先清理 6100 / 6102：
+
+```powershell
+# PowerShell（Windows）
+Get-NetTCPConnection -LocalPort 6100,6102 -ErrorAction SilentlyContinue |
+  Where-Object { $_.OwningProcess -ne 0 } |
+  ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+```
+
+```bash
+# macOS / Linux
+lsof -ti:6100,6102 | xargs kill -9 2>/dev/null
+```
+
+### 调试配置
+
+项目根目录 `.vscode/launch.json` 已包含调试配置：
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Next.js App (bun)",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": [
+        "--env-file=../../.env",
+        "--inspect=9229",
+        "next", "dev", "--port", "6100", "--hostname", "0.0.0.0"
+      ],
+      "cwd": "${workspaceFolder}/apps/crewmeld",
+      "port": 9229,
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"],
+      "serverReadyAction": {
+        "pattern": "- Local:.+(https?://.+)",
+        "uriFormat": "%s",
+        "action": "openExternally"
+      }
+    },
+    {
+      "name": "Attach to bun (port 9229)",
+      "type": "node",
+      "request": "attach",
+      "port": 9229,
+      "cwd": "${workspaceFolder}/apps/crewmeld"
+    }
+  ]
+}
+```
+
+### 调试步骤
+
+1. **启动 Socket 服务**（在终端中单独运行）：
+
+   ```bash
+   cd apps/crewmeld
+   bun run dev:sockets
+   ```
+
+2. **设置断点**：在目标文件（如 `apps/crewmeld/lib/conversation/engine.ts`）中，点击行号左侧空白处设置红色断点。
+
+3. **启动调试**：按 `F5`（或左侧"运行和调试"面板），选择 **"Debug Next.js App (bun)"**。Next.js 以 inspect 模式启动，调试器自动附加。
+
+4. **触发断点**：浏览器访问 `http://localhost:6100`，执行操作（如发送对话消息），断点命中后可查看变量、调用栈、单步执行。
+
+> **备选方式**：如果 `F5` 启动失败，可在终端手动运行 `bun --env-file=../../.env --inspect=9229 next dev --port 6100 --hostname 0.0.0.0`，然后使用 **"Attach to bun (port 9229)"** 配置附加调试器。
+
+> **注意**：调试模式与 `bun run dev:full` 互斥，不要同时运行，否则端口 6100 冲突。
+
+---
+
 ## License
 
 CrewMeld 采用基于 Apache License 2.0 修改版的开源协议，附加以下条件：

@@ -94,7 +94,7 @@ const nextConfig: NextConfig = {
 
   experimental: {
     optimizeCss: true,
-    turbopackSourceMaps: false,
+    turbopackSourceMaps: true,
     turbopackFileSystemCacheForDev: true,
     // The middleware matcher covers `/api/:path*`, so Next buffers each API
     // request body for the proxy layer. The 10MB default truncates large
