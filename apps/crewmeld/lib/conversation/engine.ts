@@ -1,24 +1,24 @@
 /**
- * Conversation engine — core message loop, self-built OpenAI-compatible API calls
+ * 对话引擎 —— 核心消息循环，自建 OpenAI 兼容 API 调用
  *
- * Flow:
- * 1. Load conversation + employee -> build system prompt -> build context window
- * 2. Resolve model credentials -> build tools
- * 3. fetch() OpenAI-compatible /chat/completions (stream: true)
- * 4. Parse SSE response, detect tool_calls
- * 5. tool_call matches wf_* -> call workflow-bridge
- * 5b. tool_call matches sop_* -> call sop-bridge (non-blocking)
- * 6. Inject tool result into messages, re-call LLM
- * 7. Loop until plain text -> stream output to frontend
+ * 流程：
+ * 1. 加载会话 + 员工 -> 构建系统提示词 -> 构建上下文窗口
+ * 2. 解析模型凭据 -> 构建工具
+ * 3. fetch() 调用 OpenAI 兼容 /chat/completions（stream: true）
+ * 4. 解析 SSE 响应，检测 tool_calls
+ * 5. tool_call 匹配 wf_* -> 调用 workflow-bridge
+ * 5b. tool_call 匹配 sop_* -> 调用 sop-bridge（非阻塞）
+ * 6. 将工具结果注入 messages，重新调用 LLM
+ * 7. 循环直到返回纯文本 -> 流式输出到前端
  */
 
 /**
- * work_logs.content i18n strategy (decided in plan T11):
- *   consumed only by UI — all read paths (employees/[id]/logs, tasks/[id]/logs) are API
- *   routes that return JSON to the frontend; no code path reads work_logs.content back
- *   into the LLM messages array or any prompt string.
+ * work_logs.content 的 i18n 策略（在计划 T11 中确定）：
+ *   仅由 UI 消费 —— 所有读取路径（employees/[id]/logs、tasks/[id]/logs）均为
+ *   返回 JSON 给前端的 API 路由；没有任何代码路径会将 work_logs.content 读回
+ *   到 LLM messages 数组或任何提示字符串中。
  *
- * Therefore: content field rendered in 'en' (T12 will switch lang→'en' + add metadata.i18nKey)
+ * 因此：content 字段以 'en' 渲染（T12 将切换 lang→'en' 并添加 metadata.i18nKey）
  */
 
 import {
@@ -98,9 +98,8 @@ const logger = createLogger('ConversationEngine')
 const MAX_TOOL_ROUNDS = 5
 
 /**
- * Prefix stamped on historical assistant replies that were genuinely derived
- * from a real SOP trigger or status query. This keeps the model from treating
- * grounded acknowledgements as a plain-chat pattern it may imitate later.
+ * 标记在历史助手回复上的前缀，表示该回复确实来源于真实的 SOP 触发或状态查询。
+ * 防止模型将有依据的确认回复当作普通聊天模式而在后续模仿。
  */
 const SOP_DERIVED_MARKER = '[Grounded in a real tool result] '
 
@@ -113,32 +112,49 @@ function isSopDerived(metadata: unknown): boolean {
 }
 
 /**
- * Process user message — returns SSE stream
- * @param preferredLocale - Optional locale hint from frontend (e.g. 'zh-CN' or 'en'),
- *   used when auto-detection is inconclusive. Does NOT override a clearly detected language.
+ * 处理用户消息 —— 返回 SSE 流
+ * @param preferredLocale - 前端传入的语言偏好（如 'zh-CN' 或 'en'），
+ *   仅在自动检测结果不确定时作为回退，不会覆盖已明确检测到的语言。
  */
 export async function processMessage(
   conversationId: string,
   userMessage: string,
   userId: string,
-  /** Files attached to user message (uploaded to MinIO, written to metadata.files) */
+  /** 用户消息附带文件（已上传至 MinIO，写入 metadata.files） */
   fileMetadata?: Array<{ key: string; name: string; size: number; mimeType: string }>,
-  /** Frontend locale preference, used as fallback when auto-detection is inconclusive */
+  /** 前端语言偏好，自动检测不确定时作为回退 */
   preferredLocale?: string,
-  /** Credentials of the connection that received the message (IM webhooks), threaded to SOP identity resolution so it uses the correct app — not a system default. */
+  /** 接收消息的渠道连接凭据（IM webhook 场景），传递给 SOP 身份解析以确保使用正确的应用而非系统默认值 */
   channelConfig?: Record<string, unknown>,
-  /** Id of the channel connection that received the message; null/undefined for web/api. */
+  /** 接收消息的渠道连接 ID；web/api 渠道为 null/undefined */
   connectionId?: string,
   knowledgeBaseIds?: string[]
 ): Promise<ReadableStream<Uint8Array>> {
+  // ═══ 编排主流程 ═══
+  // ① 加载会话 & 数字员工配置
+  // ② 保存用户消息（含文件附件、OCR、问题分析）
+  // ③ 加载历史消息 & 过期工具结果清理（>5min 视为过期）
+  // ④ 语言检测（CJK 字符集优先，拉丁语需≥8字符）
+  // ⑤ 创建 SSE 流，进入实时编排：
+  //    a. 纯文件短路 → 直接回复"请说明需求"
+  //    b. 解析调用方身份 & 加载模型/知识库/工具配置
+  //    c. 意图分类（knowledge_only / knowledge_then_sop / sop / direct）
+  //    d. 知识库检索（RAGFlow，按意图决定是否检索）
+  //    e. 构建系统提示词 & 上下文窗口
+  //    f. 消息循环（多轮 tool_call，直到 LLM 不再调用工具）
+  //    g. 记录执行结果 & 工作日志
+
+  // 创建运行时计时器，追踪编排各阶段（加载/意图分类/检索/生成）的耗时
   const timing = createRuntimeTiming(uuidv4())
+  // 创建运行时边界，包裹整个对话流程；完成时自动输出计时快照日志
   const runtimeBoundary = createConversationRuntimeBoundary(timing, (snapshot) =>
     logger.info('Conversation runtime completed', snapshot)
   )
+  // 打起始时间戳，供后续 timing.measure() 计算各阶段耗时
   const conversationLoadStart = timing.mark('request')
 
   return runtimeBoundary.load(async () => {
-    // 1. Load conversation
+    // ① 加载会话 —— 校验状态，已关闭的会话自动重新激活
     const [conv] = await db
       .select()
       .from(conversations)
@@ -150,7 +166,7 @@ export async function processMessage(
     }
 
     if (conv.status !== 'active') {
-      // Auto-reactivate closed conversations when channel messages arrive
+      // 渠道消息到达时自动重新激活已关闭的会话
       if (conv.status === 'closed' || conv.status === 'archived') {
         await db
           .update(conversations)
@@ -162,7 +178,7 @@ export async function processMessage(
       }
     }
 
-    // 2. Load employee
+    // ② 加载数字员工 —— 获取人格、配置、智能客服设定
     const [employee] = await db
       .select({
         id: digitalEmployees.id,
@@ -183,11 +199,11 @@ export async function processMessage(
       ? renderGreeting(customerService.greeting, { id: userId })
       : ''
 
-    // 3. Save user message, use first message as title if conversation has no title
-    //    Append attachment info as structured annotations to message end, for LLM / SOP tools to identify files
+    // ③ 保存用户消息 —— 处理文件附件（OCR + NFS 文件名）、问题分析采集、首次消息设为标题
+    //    将附件信息作为结构化标注追加到消息末尾，供 LLM / SOP 工具识别文件
     const userMsgId = uuidv4()
-    // File-only without text content: short-circuit by replying to ask for requirements, skip intent classification and SOP
-    // Channel plugins may auto-compose "用户发送了文件「xxx」" as placeholder, also treated as no user requirement
+    // 纯文件无文字内容：短路回复询问需求，跳过意图分类和 SOP
+    // 渠道插件可能自动生成"用户发送了文件「xxx」"作为占位符，同样视为无用户需求
     const fileOnlyPlaceholder = /^(\[User sent a file:\s.+?\];?\s*)+$/i
     const hasFileOnly =
       fileMetadata &&
@@ -211,19 +227,18 @@ export async function processMessage(
     const messageForUnderstanding = `${userMessage}${ocrContext}`
     let contentForLLM = messageForUnderstanding
     if (fileMetadata && fileMetadata.length > 0) {
-      // Unified file IO contract (spec 2026-06-01): files are pre-staged on
-      // NFS at `/root/io/<_sopFileDir>/<name>` before any tool runs.
+      // 统一文件 IO 契约（规格 2026-06-01）：文件在任何工具运行前已预先放置在
+      // NFS 的 `/root/io/<_sopFileDir>/<name>` 路径。
       //
-      // Emit ONLY the filename — no URL — so the LLM passes a bare name that
-      // the tool joins onto its `/root/io/<_sopFileDir>/` mount. Telling the
-      // LLM a URL here caused it to pass the URL as `pdf_file`, which the
-      // tool then concatenated into `/root/io/<dir>/<URL>` → FileNotFoundError.
+      // 仅输出文件名 —— 不输出 URL —— 这样 LLM 传递的是纯文件名，
+      // 工具将其拼接到 `/root/io/<_sopFileDir>/` 挂载路径上。此前告诉 LLM URL
+      // 会导致它将 URL 作为 `pdf_file` 传递，工具随后将其拼接为
+      // `/root/io/<dir>/<URL>` → FileNotFoundError。
       //
-      // The name must match the **on-disk filename** in conv-io (sanitized at
-      // upload time in file-storage.ts:67 — `[^a-zA-Z0-9._\-CJK]` → `_`).
-      // FileAttachment.name keeps the original user-facing name for the chat
-      // UI; we re-apply the same regex here so the LLM tells the tool the
-      // exact filesystem name.
+      // 文件名必须与 conv-io 中的**磁盘文件名**一致（上传时在 file-storage.ts:67
+      // 处已做清理 —— `[^a-zA-Z0-9._\-CJK]` → `_`）。FileAttachment.name 保留
+      // 原始用户可见名称用于聊天 UI；此处重新应用相同正则，确保 LLM 告诉工具的
+      // 是确切的文件系统文件名。
       const sanitizeForNfs = (name: string): string => name.replace(/[^a-zA-Z0-9._\-一-鿿]/g, '_')
       const fileAnnotations = fileMetadata.map((f) => {
         const safeName = sanitizeForNfs(f.name)
@@ -266,7 +281,7 @@ export async function processMessage(
         .where(eq(conversations.id, conversationId))
     }
 
-    // 4. Load message history
+    // ④ 加载历史消息 & 过期工具结果清理 —— 超过 5 分钟的 tool 结果标记为过期，防止 LLM 复用旧数据
     const historyRows = await db
       .select({
         role: conversationMessages.role,
@@ -281,15 +296,15 @@ export async function processMessage(
       .where(eq(conversationMessages.conversationId, conversationId))
       .orderBy(conversationMessages.createdAt)
 
-    // Expire tool interactions older than 5 minutes, prevent LLM from reusing stale data and skipping tool calls
-    // Need to expire three message types: assistant(tool_calls) -> tool(result) -> assistant(result-based reply)
-    // Use database time as baseline, avoid JS/DB timezone inconsistency
+    // 过期超过 5 分钟的工具交互，防止 LLM 复用旧数据而跳过工具调用
+    // 需要过期三种消息类型：assistant(tool_calls) -> tool(result) -> assistant(基于结果的回复)
+    // 以数据库时间为基准，避免 JS/DB 时区不一致
     const [{ dbNow }] = await db.execute<{ dbNow: Date }>(sql`SELECT NOW() as "dbNow"`)
     const dbNowMs = new Date(dbNow).getTime()
     const TOOL_RESULT_EXPIRE_MS = 5 * 60 * 1000
     const EXPIRED_HINT = t('expiredHint', 'zh')
 
-    // Step 1: mark which tool_call_ids are expired
+    // 步骤 1：标记哪些 tool_call_ids 已过期
     const expiredToolCallIds = new Set<string>()
     for (const row of historyRows) {
       if (row.role === 'tool' && row.toolCallId && row.createdAt) {
@@ -300,9 +315,9 @@ export async function processMessage(
       }
     }
 
-    // Step 2: build history messages, replace all expired tool interaction chains
+    // 步骤 2：构建历史消息，替换所有已过期的工具交互链
     const rawMessages: EngineMessage[] = historyRows.map((row) => {
-      // tool message expired -> replace content
+      // tool 消息已过期 -> 替换内容
       if (row.role === 'tool' && row.toolCallId && expiredToolCallIds.has(row.toolCallId)) {
         return {
           role: row.role as EngineMessage['role'],
@@ -311,7 +326,7 @@ export async function processMessage(
           name: row.toolName ?? undefined,
         }
       }
-      // assistant with tool_calls and all calls expired -> preserve tool_calls structure but mark
+      // 带有 tool_calls 的 assistant 且所有调用均已过期 -> 保留 tool_calls 结构但标记
       if (row.role === 'assistant' && row.toolCalls) {
         const calls = row.toolCalls as ToolCall[]
         const allExpired = calls.length > 0 && calls.every((tc) => expiredToolCallIds.has(tc.id))
@@ -335,8 +350,8 @@ export async function processMessage(
       }
     })
 
-    // Step 3: expire assistant plain text replies (summaries based on tool results) following expired tool chains
-    // Message order: ... -> assistant(tool_calls) -> tool(result) -> assistant(summary) -> ...
+    // 步骤 3：过期紧跟在已过期工具链之后的 assistant 纯文本回复（基于工具结果的摘要）
+    // 消息顺序：... -> assistant(tool_calls) -> tool(result) -> assistant(summary) -> ...
     const expiredMessages: EngineMessage[] = rawMessages.map((msg, i) => {
       if (
         msg.role === 'assistant' &&
@@ -344,30 +359,28 @@ export async function processMessage(
         msg.content &&
         msg.content !== EXPIRED_HINT
       ) {
-        // Look backward: if the preceding message is an expired tool message, current assistant is also a summary based on expired data
+        // 向前查找：如果前一条消息是已过期的 tool 消息，则当前 assistant 也是基于过期数据的摘要
         for (let j = i - 1; j >= 0; j--) {
           const prev = rawMessages[j]
           if (prev.role === 'tool' && prev.content === EXPIRED_HINT) {
             return { ...msg, content: EXPIRED_HINT }
           }
-          // Skip consecutive tool messages (multi-tool call scenario)
+          // 跳过连续的 tool 消息（多工具调用场景）
           if (prev.role !== 'tool') break
         }
       }
       return msg
     })
 
-    // Step 4: strip raw tool-call structure (assistant tool_calls + tool results)
-    // from the history sent to the LLM. The expiry above already neutralised stale
-    // summaries (so the model still re-invokes tools when data is old); this only
-    // removes the structural tool-call payloads that would otherwise prime the
-    // model to echo a tool call — e.g. a permission-filtered SOP — back to the
-    // user as raw JSON. DB persistence and the UI (which read conversation_messages
-    // directly) are unaffected.
+    // 步骤 4：从发送给 LLM 的历史中剥离原始工具调用结构（assistant tool_calls + tool 结果）。
+    // 上面的过期处理已中和了过期摘要（使模型在数据过期时仍会重新调用工具）；
+    // 此处仅移除结构化的工具调用载荷，否则会使模型倾向于将工具调用
+    // —— 例如被权限过滤的 SOP —— 作为原始 JSON 回传给用户。
+    // 数据库持久化和 UI（直接读取 conversation_messages）不受影响。
     const historyMessages: EngineMessage[] = stripToolStructureFromHistory(expiredMessages)
     timing.measure('conversationLoadMs', conversationLoadStart)
 
-    // Language detection — completed before entering stream, for progress text and system prompt
+    // ④ 语言检测 —— CJK 字符集优先（可靠），拉丁语需≥8字符或回退到历史消息/前端偏好
     const LANGUAGE_LABELS: Record<string, string> = {
       zh: '简体中文',
       en: 'English',
@@ -476,13 +489,13 @@ export async function processMessage(
       'xin chào': 'vi',
       'cảm ơn': 'vi',
     }
-    // CJK languages use character set detection, reliable even for short text; Latin languages use statistics, require sufficient length
+    // CJK 语言使用字符集检测，短文本也可靠；拉丁语系使用统计方法，需要足够长度
     const CJK_RELIABLE_CODES = new Set(['zh', 'ja', 'ko', 'th', 'ar', 'ru'])
 
     const detectUserLanguage = (message: string, history: EngineMessage[]): string => {
-      // Short-circuit: any CJK Han character → treat as zh/ja/ko directly.
-      // tinyld misclassifies short mixed-script messages (e.g. zh + a few Latin tokens)
-      // as Latin, which then routes status text to the wrong language.
+      // 短路：任意 CJK 汉字 → 直接判定为 zh/ja/ko。
+      // tinyld 会将短的混合脚本消息（如中文 + 少量拉丁词）误判为拉丁语，
+      // 从而将状态文本路由到错误的语言。
       if (/\p{Script=Han}/u.test(message)) {
         const cjkCode = detect(message)
         if (cjkCode === 'ja' || cjkCode === 'ko') return LANGUAGE_LABELS[cjkCode]
@@ -492,7 +505,7 @@ export async function processMessage(
       const phraseCode = SHORT_PHRASE_MAP[normalized]
       if (phraseCode && LANGUAGE_LABELS[phraseCode]) return LANGUAGE_LABELS[phraseCode]
       const code = detect(message)
-      // Trust CJK and other non-Latin short text; Latin languages need >= 8 chars
+      // 信任 CJK 及其他非拉丁语的短文本；拉丁语系需要 >= 8 个字符
       if (code && LANGUAGE_LABELS[code] && (CJK_RELIABLE_CODES.has(code) || message.length >= 8))
         return LANGUAGE_LABELS[code]
       const recentUserMessages = history
@@ -503,7 +516,7 @@ export async function processMessage(
         if (histCode && LANGUAGE_LABELS[histCode]) return LANGUAGE_LABELS[histCode]
       }
       if (code && LANGUAGE_LABELS[code]) return LANGUAGE_LABELS[code]
-      // Fallback: use frontend preferred locale if provided, otherwise default to Chinese
+      // 回退：使用前端语言偏好（如有），否则默认中文
       if (preferredLocale) {
         const localeCode = preferredLocale.startsWith('en') ? 'en' : preferredLocale.split('-')[0]
         if (LANGUAGE_LABELS[localeCode]) return LANGUAGE_LABELS[localeCode]
@@ -516,31 +529,31 @@ export async function processMessage(
     const lang = isZh ? 'zh' : 'en'
     logger.info('Language detection', { userMessage: userMessage.slice(0, 50), userLanguage, lang })
 
-    // Multilingual progress text
+    // 多语言进度文本
     const PROGRESS_MESSAGES = {
       queryingKnowledge: t('queryingKnowledge', lang),
       generating: t('generating', lang),
     }
 
-    // Move time-consuming operations 5-13 inside stream, to push progress events
+    // ⑤ 创建 SSE 流 —— 后续步骤在流内执行，实时推送进度事件
     return new ReadableStream<Uint8Array>({
       async start(controller) {
-        /** Safe enqueue — silently skip after controller closes, avoid crash */
+        /** 安全入队 —— controller 关闭后静默跳过，避免崩溃 */
         const safeEnqueue = (chunk: Uint8Array) => {
           try {
             controller.enqueue(chunk)
           } catch {
-            // controller was cancelled by consumer (e.g. SSE timeout), silently ignore
+            // controller 被消费方取消（如 SSE 超时），静默忽略
           }
         }
         const sse = createConversationSseEmitter(safeEnqueue)
 
-        /** Push progress hint */
+        /** 推送进度提示 */
         const pushProgress = (message: string) => {
           sse.progress(message)
         }
 
-        // Push "thinking" immediately, for frontend to display (following user input language)
+        // 立即推送"思考中"，供前端显示（跟随用户输入语言）
         pushProgress(t('thinking', lang))
 
         const taskId = uuidv4()
@@ -559,7 +572,7 @@ export async function processMessage(
             })
           },
           execute: async (runtimeTiming) => {
-            // File-only short-circuit: user only sent files without text, reply asking for requirements, skip intent and SOP
+            // ⑤a 纯文件短路：用户只发了文件没有文字，直接回复询问需求，跳过意图分类和 SOP
             if (hasFileOnly && !ocrContext) {
               const fileNames = fileMetadata!.map((f) => `「${f.name}」`).join('、')
               const replyContent = t('convFileReceived', lang, { files: fileNames })
@@ -601,13 +614,11 @@ export async function processMessage(
               return
             }
 
-            // Resolve caller identity for SOP-visibility filtering (cached 5min for IM;
-            // the SOP bridge reuses the same cache). IM channels resolve from their
-            // directory; web resolves from the platform user + RBAC roles (gated under
-            // the synthetic 'web' connection). 'api' (and any other non-IM) yield a
-            // null identity and null connectionId → default visibility.
-            // 5-7. Start independent preparation reads together. Tool visibility
-            // loading starts only after the caller identity resolves.
+            // ⑤b 解析调用方身份 & 并行加载模型配置/知识库/工具配置（身份解析决定 SOP 可见性）
+            // SOP bridge 复用同一缓存）。IM 渠道从其通讯录解析；
+            // web 从平台用户 + RBAC 角色解析（受合成的 'web' 连接门控）。
+            // 'api'（及其他非 IM 渠道）产生 null 身份和 null connectionId → 默认可见性。
+            // 5-7. 同时启动独立的预读取。工具可见性加载仅在调用方身份解析后启动。
             const {
               toolConfigs: {
                 tools,
@@ -642,6 +653,7 @@ export async function processMessage(
             const hasTools = tools.length > 0
             const sopNames = sopInfos.map((s) => s.name)
 
+            // ⑤c 意图分类 —— 决定走知识库检索、SOP 执行还是直接对话
             let intentResult = await measureRuntimeOperation(runtimeTiming, 'routeMs', () =>
               classifyIntent(messageForUnderstanding, historyMessages, modelConfig, {
                 hasKnowledgeBase,
@@ -663,7 +675,7 @@ export async function processMessage(
               reason: intentResult.reason,
             })
 
-            // Push intent classification result to frontend
+            // 推送意图分类结果到前端
             const intentEvent: ConversationEvent = {
               type: 'intent:classified',
               data: {
@@ -674,7 +686,7 @@ export async function processMessage(
             }
             safeEnqueue(encodeSSE(intentEvent))
 
-            // 8. Query knowledge base based on intent
+            // ⑤d 知识库检索 —— 按意图决定是否查询 RAGFlow（智能客服模式强制只走知识库）
             let knowledgeReference: string | null = null
             let knowledgeReferences: KnowledgeChunkReference[] = []
             let unansweredReason: UnansweredReason | null = null
@@ -686,10 +698,9 @@ export async function processMessage(
               hasKnowledgeBase
             ) {
               pushProgress(PROGRESS_MESSAGES.queryingKnowledge)
-              // Always retrieve against the user's original wording. The intent
-              // classifier strips signal words ("...的参数", "...怎么用") down to
-              // keyword stubs, which then over-recalls product-overview chunks
-              // instead of the parameter/spec chunk the user actually asked for.
+              // 始终基于用户原始措辞检索。意图分类器会将信号词
+              //（"...的参数"、"...怎么用"）剥离为关键词桩，导致过度召回
+              // 产品概览分块，而非用户实际所需的参数/规格分块。
               const searchQuery = messageForUnderstanding
               const retrievalStart = runtimeTiming.mark('retrieval')
               const kbResult = await queryEmployeeKnowledge(
@@ -727,19 +738,19 @@ export async function processMessage(
               }
             }
 
-            // 9. Determine tool set based on intent
+            // ⑤e 确定工具集 —— 智能客服模式或 knowledge_only 意图时不带工具
             const effectiveTools =
               customerService.customerService || intentResult.intent === 'knowledge_only'
                 ? []
                 : tools
 
-            // 10. Build SOP name map (tool function name -> display name)
+            // 10. 构建 SOP 名称映射（工具函数名 -> 显示名称）
             const sopNameMap = new Map<string, string>()
             for (const info of sopInfos) {
               sopNameMap.set(`sop_${info.id}`, info.name)
             }
 
-            // 11. Build system prompt (language already detected outside stream)
+            // ⑤f 构建系统提示词 —— 融合数字员工人格、SOP 列表、知识库引用、开场白
             let systemPrompt = buildSystemPrompt(
               employee,
               [],
@@ -752,12 +763,14 @@ export async function processMessage(
               systemPrompt +=
                 '\n\n## Customer Service Mode\n仅使用已检索的知识库内容回答，不执行任务流程或外部工具；没有可靠依据时请明确告知用户。'
             }
+            // 检查历史消息中是否已发送过开场白（metadata.source === 'greeting'）
             const hasPersistedGreeting = historyRows.some(
               (row) =>
                 row.metadata &&
                 typeof row.metadata === 'object' &&
                 (row.metadata as Record<string, unknown>).source === 'greeting'
             )
+            // 仅在首次对话时注入开场白：有开场白配置 + 未发送过 + 消息数≤1
             if (greeting && !hasPersistedGreeting && historyRows.length <= 1) {
               systemPrompt += `\n\n## Opening Greeting\nBegin your first response with: ${greeting}`
             }
@@ -772,14 +785,14 @@ export async function processMessage(
             })
             logger.info('System prompt', { systemPrompt: systemPrompt.slice(0, 1000) })
 
-            // 11. Build context window, sized to the actual bound model's context window
+            // ⑤g 构建上下文窗口 —— 按模型实际 context window 截断历史
             const contextMessages = buildContextWindow(
               historyMessages,
               systemPrompt,
               resolveContextConfig(modelConfig.model)
             )
 
-            // 12. Enter message loop
+            // ⑤h 消息循环 —— 多轮 tool_call，LLM 可调用工具/SOP，结果回传后继续生成，直到不再调用工具
             pushProgress(PROGRESS_MESSAGES.generating)
 
             const loopResult = await runMessageLoop(
@@ -821,6 +834,7 @@ export async function processMessage(
                 reason: unansweredReason ?? 'model_declined',
               })
             }
+            // ⑤i 记录执行结果 & 工作日志（智能客服模式额外记录未回答问题）
             await db
               .update(taskExecutions)
               .set({
@@ -878,7 +892,7 @@ export async function processMessage(
             try {
               controller.close()
             } catch {
-              /* already closed */
+              /* 已关闭 */
             }
           },
         })
@@ -892,12 +906,12 @@ interface ModelConfig {
   model: string
   apiKey: string
   baseUrl: string
-  /** User-defined passthrough params merged into the request body (e.g. enable_thinking). */
+  /** 用户自定义的透传参数，合并到请求体中（如 enable_thinking）。 */
   extraParams?: Record<string, unknown>
 }
 
 /**
- * Message loop — supports multi-round tool_call
+ * 消息循环 —— 支持多轮 tool_call
  */
 async function runMessageLoop(
   enqueue: (chunk: Uint8Array) => void,
@@ -911,7 +925,7 @@ async function runMessageLoop(
   workflowMap: Map<string, string>,
   sopMap: Map<string, string>,
   sopNameMap: Map<string, string>,
-  /** sopToolName (`sop_<id>`) → denied SOP descriptor; calls to these are rejected program-side. */
+  /** sopToolName（`sop_<id>`）→ 被拒绝的 SOP 描述符；对这些的调用在程序侧被拒绝。 */
   deniedSopMap: Map<string, { id: string; name: string }>,
   skillMap: Map<string, { skillId: string; endpoint: string; openclawConnectionId?: string }>,
   modelConfig: ModelConfig,
@@ -920,9 +934,9 @@ async function runMessageLoop(
   knowledgeReferences: KnowledgeChunkReference[] = [],
   taskId = '',
   isZh = true,
-  /** Credentials of the connection that received the message — threaded to SOP identity resolution. */
+  /** 接收消息的连接凭据 —— 传递给 SOP 身份解析。 */
   channelConfig?: Record<string, unknown>,
-  /** Files attached to the current user message — the fallback seed set when the LLM names no `input_files`. */
+  /** 当前用户消息附带的文件 —— 当 LLM 未指定 `input_files` 时的回退种子集。 */
   fileMetadata?: Array<{ key: string; name: string; size: number; mimeType: string }>
 ): Promise<{ outputSummary: string | null; totalTokens: number }> {
   const lang = isZh ? 'zh' : 'en'
@@ -930,19 +944,19 @@ async function runMessageLoop(
 
   let totalTokens = 0
 
-  /** Files produced during tool execution (uploaded to MinIO), written to assistant message metadata */
+  /** 工具执行期间产生的文件（已上传至 MinIO），写入助手消息 metadata */
   const collectedFileMetadata: FileAttachment[] = []
 
-  /** Set of SOP IDs triggered in this conversation round — prevent cross-round duplicate triggers */
+  /** 本轮对话中已触发的 SOP ID 集合 —— 防止跨轮重复触发 */
   const triggeredSopIds = new Set<string>()
 
-  /** Whether the previous round produced a grounded SOP result. */
+  /** 上一轮是否产生了有依据的 SOP 结果。 */
   let previousRoundHadSopOutput = false
   let firstTokenRecorded = false
   const conversationSse = createConversationSseEmitter(enqueue)
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    // Notify frontend message started
+    // 通知前端消息开始
     const messageSse = conversationSse.startMessage(round)
 
     const llmStart = timing.mark('llm')
@@ -959,7 +973,7 @@ async function runMessageLoop(
     )
     totalTokens += usage.total
 
-    // Write model call log
+    // 写入模型调用日志
     logModelUsage({
       provider: modelConfig.providerId,
       model: modelConfig.model,
@@ -998,7 +1012,7 @@ async function runMessageLoop(
         .catch(() => {})
     }
 
-    // Plain text reply — save and end
+    // 纯文本回复 —— 保存并结束
     if (!toolCalls || toolCalls.length === 0) {
       const rawContent = content ?? ''
       const claimedIds = extractSopExecutionIds(rawContent)
@@ -1061,8 +1075,8 @@ async function runMessageLoop(
       return { outputSummary: finalContent.slice(0, 200) || null, totalTokens }
     }
 
-    // Has tool_calls — save assistant message
-    // Discard content of tool_call rounds, prevent LLM from seeing already-answered content in later rounds and generating duplicates
+    // 有 tool_calls —— 保存助手消息
+    // 丢弃 tool_call 轮次的内容，防止 LLM 在后续轮次看到已回复的内容而产生重复
     messageSse.toolOnly()
     const assistantToolMsgId = uuidv4()
     await db.insert(conversationMessages).values({
@@ -1076,7 +1090,7 @@ async function runMessageLoop(
 
     messages.push({ role: 'assistant', content: null, tool_calls: toolCalls })
 
-    // Process each tool_call (max 1 SOP per round)
+    // 处理每个 tool_call（每轮最多 1 个 SOP）
     let sopCalledThisRound = false
     let hasRealToolExecution = false
     let sopOutputThisRound = false
@@ -1094,7 +1108,7 @@ async function runMessageLoop(
       }
       enqueue(encodeSSE(toolStartEvent))
       let toolResult = ''
-      let skipPersist = false // Intercepted responses not saved to conversation history, avoid refreshing expiry window
+      let skipPersist = false // 被拦截的响应不保存到对话历史，避免刷新过期窗口
       await measureRuntimeOperation(timing, 'toolMs', async () => {
         const wfId = workflowMap.get(tc.function.name)
         const sopId = sopMap.get(tc.function.name)
@@ -1109,7 +1123,7 @@ async function runMessageLoop(
         }
 
         if (tc.function.name === 'check_sop_status') {
-          // SOP status query
+          // SOP 状态查询
           const executionId = (args.execution_id as string) ?? ''
           if (!executionId) {
             toolResult = t('missingExecutionId', lang)
@@ -1119,7 +1133,7 @@ async function runMessageLoop(
             sopOutputThisRound = true
           }
         } else if (tc.function.name === 'query_my_tasks') {
-          // User task list query
+          // 用户任务列表查询
           const filter = (args.filter as TaskFilter) ?? 'all'
           const limit = typeof args.limit === 'number' ? args.limit : 10
           const taskResult = await queryUserTasks(userId, filter, limit)
@@ -1128,6 +1142,8 @@ async function runMessageLoop(
           // Restricted task: caller lacks permission. Reject program-side without
           // executing; the message is returned so the LLM relays the refusal.
           // hasRealToolExecution stays false; no SOP dedup/trigger logic runs.
+// 受限任务：调用方缺乏权限。在程序端直接拒绝，不予执行；将相关信息返回，以便由大语言模型（LLM）传达这一拒绝。
+// hasRealToolExecution 保持为 false；不会执行任何 SOP 去重或触发逻辑。
           toolResult = t('sopNoPermission', lang, { name: deniedSop.name })
           logger.warn('Denied SOP invocation blocked program-side', {
             conversationId,
@@ -1155,6 +1171,8 @@ async function runMessageLoop(
           if (!triggeredSopIds.has(sopId)) {
             // Check DB: same user + same SOP + same user message + triggered within last 5 min
             // Use database time NOW() for comparison, avoid JS/DB timezone inconsistency causing misjudgment
+// 检查数据库：同一用户 + 同一 SOP + 同一用户消息 + 触发时间在过去 5 分钟内
+// 使用数据库时间 NOW() 进行比对，避免因 JS 与数据库时区不一致而导致误判            
             const [recent] = await db
               .select({ id: sopExecutions.id })
               .from(sopExecutions)
